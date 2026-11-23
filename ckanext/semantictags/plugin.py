@@ -1,4 +1,5 @@
 import logging
+import os
 
 import ckan.lib.base as base
 import ckan.logic as logic
@@ -11,15 +12,15 @@ from ckan.logic.action.create import package_create as core_package_create
 from ckan.logic.action.get import package_show as core_package_show
 from ckan.logic.action.update import package_update as core_package_update
 from ckan.plugins.toolkit import asbool
-from flask import Blueprint, request
+from flask import Blueprint, request, jsonify
 
 from ckanext.semantictags import cli
 
 from ckanext.semantictags.helpers import (
     ONTOLOGIES_KEY, FREE_TAGS_KEY, FORCE_RELOAD_KEY, UPDATE_FREQUENCY_KEY, TAG_SUGGEST_KEY,
     generate_tag_vocabulary, LDM_tags_util, resolve_vocab_tags,
-    search_ontologies, 
-    get_available_ontologies, 
+    search_ontologies,
+    get_available_ontologies,
 )
 from ckanext.semantictags.tasks import Scheduler
 from ckanext.semantictags.model import tag as tag_model
@@ -32,6 +33,49 @@ log.setLevel(logging.DEBUG)
 
 TIB_TS_API = 'https://api.terminology.tib.eu/api/v2'
 
+UMLS_API_BASE = 'https://uts-ws.nlm.nih.gov/rest'
+UMLS_IRI_PREFIX = 'http://linkedlifedata.com/resource/umls/id/'
+
+
+def _get_umls_api_key():
+    return (
+        config.get('ckan.umls.api_key')
+        or config.get('umls.api_key')
+        or os.environ.get('CKAN__UMLS__API_KEY')
+    )
+
+
+def _search_umls(query, limit=10):
+    query = (query or '').strip()
+    api_key = _get_umls_api_key()
+    if len(query) < 3 or not api_key:
+        return []
+
+    try:
+        resp = http_requests.get(
+            f'{UMLS_API_BASE}/search/current',
+            params={'string': query, 'apiKey': api_key, 'pageSize': limit},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        items = resp.json().get('result', {}).get('results', [])
+    except http_requests.RequestException as e:
+        log.warning(f'UMLS search failed for "{query}": {e}')
+        return []
+
+    results = []
+    for item in items:
+        cui = item.get('ui', '')
+        name = item.get('name', '')
+        # UMLS returns ui="NONE" when no concepts match
+        if not cui or cui == 'NONE' or not name:
+            continue
+        results.append({
+            'id': f'{name} [{cui}]',
+            'text': f'{name} ({cui})',
+            'ontology': 'umls',
+        })
+    return results
 
 @toolkit.side_effect_free
 def term_details(context, data_dict):
@@ -46,6 +90,42 @@ def term_details(context, data_dict):
     iri = data_dict.get('iri', '').strip()
     if not iri:
         raise toolkit.ValidationError({'iri': ['Missing value']})
+
+    if iri.startswith(UMLS_IRI_PREFIX):
+        cui = iri[len(UMLS_IRI_PREFIX):].strip('/')
+        api_key = _get_umls_api_key()
+        if not api_key:
+            return {'error': 'UMLS API key not configured'}
+        try:
+            cui_resp = http_requests.get(
+                f'{UMLS_API_BASE}/content/current/CUI/{cui}',
+                params={'apiKey': api_key},
+                timeout=5,
+            )
+            cui_resp.raise_for_status()
+            concept = cui_resp.json().get('result', {})
+
+            definition = None
+            def_resp = http_requests.get(
+                f'{UMLS_API_BASE}/content/current/CUI/{cui}/definitions',
+                params={'apiKey': api_key, 'pageSize': 1},
+                timeout=5,
+            )
+            if def_resp.ok:
+                defs = def_resp.json().get('result', [])
+                if defs:
+                    definition = defs[0].get('value')
+
+            return {
+                'label': concept.get('name', cui),
+                'iri': iri,
+                'curie': f'UMLS:{cui}',
+                'ontology_name': 'umls',
+                'definition': definition,
+            }
+        except http_requests.RequestException as e:
+            log.warning(f'UMLS term_details failed for {cui}: {e}')
+            return {'error': 'UMLS service unavailable'}
 
     try:
         term_resp = http_requests.get(
@@ -98,18 +178,16 @@ def autocomplete_term(context, data_dict):
 
     tags_util = LDM_tags_util()
     vocab = VocabularyQuery.read_name(tags_util.vocabulary_name_default)
-    if not vocab:
-        return []
 
-    res = OntologyManager.search_terms(query, limit=limit, vocabulary_id=vocab.id)
+    if vocab:
+        res = OntologyManager.search_terms(query, limit=limit, vocabulary_id=vocab.id)
+        for t in res:
+            label = getattr(t, 'label', None) or t.name
+            ontology = getattr(t, 'ontology', '') or ''
+            results.append({'id': label, 'text': label, 'ontology': ontology})
 
-    results = []
-    for t in res:
-        label = getattr(t, 'label', None) or t.name
-        ontology = getattr(t, 'ontology', '') or ''
-        results.append({'id': label, 'text': label, 'ontology': ontology})
+    results.extend(_search_umls(query, limit=limit))
     return results
-
 
 def suggest_tags_from_text(context, data_dict):
     """
@@ -191,6 +269,8 @@ def package_show(context, data_dict):
             continue
         tag['iri'] = tag_row.iri
         tag['ontology'] = tag_row.ontology
+        if tag_row.iri and tag_row.iri.startswith(UMLS_IRI_PREFIX):
+            tag['umls_cui'] = tag_row.iri[len(UMLS_IRI_PREFIX):].strip('/')
         if hasattr(tag_row, 'label') and tag_row.label:
             tag['display_name'] = tag_row.label
         if getattr(tag_row, 'vocabulary_id', None) and not tag.get('vocabulary_id'):
@@ -240,7 +320,7 @@ def _check_access():
 class LDMtagsPlugin(plugins.SingletonPlugin):
     plugins.implements(plugins.IConfigurer)
     plugins.implements(plugins.ITemplateHelpers)
-    plugins.implements(plugins.IActions) 
+    plugins.implements(plugins.IActions)
     plugins.implements(plugins.IBlueprint)
     plugins.implements(plugins.IClick)
     plugins.implements(plugins.IPackageController, inherit=True)
@@ -268,7 +348,7 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
 
         if config_.get(UPDATE_FREQUENCY_KEY, None) is None:
             config_[UPDATE_FREQUENCY_KEY] = 60
- 
+
         self.scheduler = Scheduler()
 
     def update_config_schema(self, schema):
@@ -303,7 +383,7 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
             'semantictags_term_details': term_details,
             'semantictags_suggest_tags': suggest_tags_from_text,
             'semantictags_ontology_search': ontology_search_action,
-            'package_show': package_show, 
+            'package_show': package_show,
             'package_create': package_create,
             'package_update': package_update
         }
@@ -317,7 +397,7 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
 
             if request.method == 'POST':
                 action = request.form.get('action', None)
-                
+
                 if action == 'ontologies':
                     ontologies_str = request.form.get(ONTOLOGIES_KEY, '').strip()
                     ontologies_list = [o.strip() for o in ontologies_str.split(',') if o.strip()]
@@ -332,7 +412,7 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
                         })
                         generate_tag_vocabulary(ontologies=ontologies_list)
                         toolkit.h.flash_success(toolkit._('New ontologies set successfully.'))
-                
+
                 elif action == 'free_tags':
                     free_tags = request.form.get(FREE_TAGS_KEY)
                     try:
