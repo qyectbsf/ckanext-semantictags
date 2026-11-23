@@ -1,0 +1,13 @@
+{
+    "scheming_version": 2,
+    "about": "SemanticTags preset overrides",
+    "presets": [
+        {
+            "preset_name": "tag_string_autocomplete",
+            "values": {
+                "form_snippet": "semantictags_autocomplete.html",
+                "validators": "ignore_missing tag_string_convert"
+            }
+        }
+    ]
+}
