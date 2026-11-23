@@ -181,6 +181,8 @@ def autocomplete_term(context, data_dict):
     query = data_dict.get('q') or data_dict.get('incomplete', '')
     limit = int(data_dict.get('limit') or 10)
 
+    results = []
+
     tags_util = LDM_tags_util()
     vocab = VocabularyQuery.read_name(tags_util.vocabulary_name_default)
 
