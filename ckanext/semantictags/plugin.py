@@ -37,6 +37,11 @@ UMLS_API_BASE = 'https://uts-ws.nlm.nih.gov/rest'
 UMLS_IRI_PREFIX = 'http://linkedlifedata.com/resource/umls/id/'
 
 
+def _asbool_safe(value, default=False):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    return asbool(value)
+
 def _get_umls_api_key():
     return (
         config.get('ckan.umls.api_key')
@@ -295,14 +300,11 @@ def get_data_module_source():
 def get_loaded_ontologies():
     return OntologyManager.list_ontologies()
 
-
 def free_tags_allowed():
-    return asbool(config.get(FREE_TAGS_KEY))
-
+    return _asbool_safe(config.get(FREE_TAGS_KEY), default=False)
 
 def tag_suggestions_enabled():
-    return asbool(config.get(TAG_SUGGEST_KEY))
-
+    return _asbool_safe(config.get(TAG_SUGGEST_KEY), default=False)
 
 def _check_access():
     context = {
@@ -348,6 +350,10 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
 
         if config_.get(UPDATE_FREQUENCY_KEY, None) is None:
             config_[UPDATE_FREQUENCY_KEY] = 60
+
+        for key in (FREE_TAGS_KEY, FORCE_RELOAD_KEY, TAG_SUGGEST_KEY):
+            if not config_.get(key):
+                config_[key] = 'false'
 
         self.scheduler = Scheduler()
 
@@ -479,11 +485,11 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
 
             return toolkit.render('admin_semantictags.jinja2',
                                   extra_vars={
-                                      'ontologies': config.get(ONTOLOGIES_KEY, '').strip(),
+                                      'ontologies': (config.get(ONTOLOGIES_KEY) or '').strip(),
                                       'preselected_ontologies': preselected_ontologies,
-                                      'free_tags': config.get(FREE_TAGS_KEY).lower(),
-                                      'force_reload': config.get(FORCE_RELOAD_KEY).lower(),
-                                      'tag_suggest': config.get(TAG_SUGGEST_KEY).lower(),
+                                      'free_tags': (config.get(FREE_TAGS_KEY) or 'false').lower(),
+                                      'force_reload': (config.get(FORCE_RELOAD_KEY) or 'false').lower(),
+                                      'tag_suggest': (config.get(TAG_SUGGEST_KEY) or 'false').lower(),
                                       'freq': config.get(UPDATE_FREQUENCY_KEY),
                                   })
 
