@@ -1,7 +1,10 @@
 import logging
 import os
+import json
+import re
 
 import ckan.lib.base as base
+from ckan.lib.redis import connect_to_redis
 import ckan.logic as logic
 import ckan.model as model
 import ckan.plugins as plugins
@@ -24,7 +27,9 @@ from ckanext.semantictags.helpers import (
 )
 from ckanext.semantictags.tasks import Scheduler
 from ckanext.semantictags.model import tag as tag_model
+from ckanext.semantictags.model import umls_cache as umls_cache_model
 from ckanext.semantictags.model.crud import OntologyManager, TagQuery, VocabularyQuery
+from ckanext.semantictags.model.umls_cache import UMLSCacheQuery
 
 NotFound = logic.NotFound
 
@@ -36,6 +41,65 @@ TIB_TS_API = 'https://api.terminology.tib.eu/api/v2'
 UMLS_API_BASE = 'https://uts-ws.nlm.nih.gov/rest'
 UMLS_IRI_PREFIX = 'http://linkedlifedata.com/resource/umls/id/'
 
+_INVALID_TAG_CHARS = re.compile(r'[^\w\s.\-]', re.UNICODE)
+_PENDING_UMLS_TTL = 3600  # 1 hour
+
+
+def _sanitize_tag_name(name, max_len=100):
+    clean = _INVALID_TAG_CHARS.sub('', name or '')
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean[:max_len].strip()
+
+
+def _pending_key(tag_name):
+    return f'semantictags:umls:pending:{tag_name.strip().lower()}'
+
+
+def _stash_pending_umls(tag_name, payload):
+    try:
+        redis_conn = connect_to_redis()
+        redis_conn.set(_pending_key(tag_name), json.dumps(payload), ex=_PENDING_UMLS_TTL)
+    except Exception as e:
+        log.warning(f'Could not cache pending UMLS tag "{tag_name}" in Redis: {e}')
+
+
+def _pop_pending_umls(tag_name):
+    try:
+        redis_conn = connect_to_redis()
+        raw = redis_conn.get(_pending_key(tag_name))
+        if not raw:
+            return None
+        return json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+    except Exception as e:
+        log.warning(f'Could not read pending UMLS tag "{tag_name}" from Redis: {e}')
+        return None
+
+def _extract_submitted_tag_names(data_dict):
+    names = []
+    tag_string = data_dict.get('tag_string')
+    if isinstance(tag_string, str) and tag_string.strip():
+        names.extend(t.strip() for t in tag_string.split(',') if t.strip())
+    for tag in data_dict.get('tags') or []:
+        if isinstance(tag, dict) and tag.get('name'):
+            names.append(tag['name'].strip())
+        elif isinstance(tag, str) and tag.strip():
+            names.append(tag.strip())
+    return names
+
+
+def _persist_selected_umls_tags(data_dict):
+    for name in _extract_submitted_tag_names(data_dict):
+        if UMLSCacheQuery.get_by_tag_name(name):
+            continue
+        pending = _pop_pending_umls(name)
+        if not pending:
+            continue
+        UMLSCacheQuery.upsert(
+            cui=pending['cui'],
+            ckan_tag_name=pending['ckan_tag_name'],
+            preferred_name=pending['preferred_name'],
+            iri=pending['iri'],
+        )
 
 def _asbool_safe(value, default=False):
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -52,9 +116,25 @@ def _get_umls_api_key():
 
 def _search_umls(query, limit=10):
     query = (query or '').strip()
-    api_key = _get_umls_api_key()
-    if len(query) < 3 or not api_key:
+    if len(query) < 3:
         return []
+
+    results = []
+    seen_cuis = set()
+
+    # 1. Local cache of already-saved UMLS tags
+    for cached in UMLSCacheQuery.search(query, limit=limit):
+        seen_cuis.add(cached.cui)
+        results.append({
+            'id': cached.ckan_tag_name,
+            'text': f'{cached.preferred_name} ({cached.cui})',
+            'ontology': 'umls',
+        })
+
+    # 2. Live UMLS API for new terms
+    api_key = _get_umls_api_key()
+    if not api_key or len(results) >= limit:
+        return results[:limit]
 
     try:
         resp = http_requests.get(
@@ -66,31 +146,42 @@ def _search_umls(query, limit=10):
         items = resp.json().get('result', {}).get('results', [])
     except http_requests.RequestException as e:
         log.warning(f'UMLS search failed for "{query}": {e}')
-        return []
+        return results
 
-    results = []
     for item in items:
         cui = item.get('ui', '')
         name = item.get('name', '')
-        # UMLS returns ui="NONE" when no concepts match
-        if not cui or cui == 'NONE' or not name:
+        if not cui or cui == 'NONE' or not name or cui in seen_cuis:
             continue
+
+        clean_name = _sanitize_tag_name(name)
+        if len(clean_name) < 2:
+            continue
+
+        seen_cuis.add(cui)
+        iri = f'{UMLS_IRI_PREFIX}{cui}'
+        _stash_pending_umls(clean_name, {
+            'cui': cui,
+            'ckan_tag_name': clean_name,
+            'preferred_name': name,
+            'iri': iri,
+        })
+
         results.append({
-            'id': f'{name} [{cui}]',
+            'id': clean_name,
             'text': f'{name} ({cui})',
             'ontology': 'umls',
         })
+        if len(results) >= limit:
+            break
+
     return results
 
 @toolkit.side_effect_free
 def term_details(context, data_dict):
     """
-    Fetch term details from TIB Terminology Service (OLS4 v2) by IRI.
-
-    :param iri: the term IRI
-    :type iri: str
-
-    :returns: dict with label, iri, ontology_name, ontology_title, definition
+    Fetch term details by IRI from the local UMLS cache / UMLS UTS API
+    (for UMLS IRIs) or TIB Terminology Service (OLS4 v2).
     """
     iri = data_dict.get('iri', '').strip()
     if not iri:
@@ -98,45 +189,99 @@ def term_details(context, data_dict):
 
     if iri.startswith(UMLS_IRI_PREFIX):
         cui = iri[len(UMLS_IRI_PREFIX):].strip('/')
+        cached = UMLSCacheQuery.get_by_iri(iri) or UMLSCacheQuery.get_by_cui(cui)
+
+        # 1. Full cache hit (definition already fetched, including "" for none)
+        if cached and cached.definition is not None:
+            return {
+                'label': cached.preferred_name,
+                'iri': cached.iri,
+                'curie': f'UMLS:{cached.cui}',
+                'ontology_name': 'umls',
+                'definition': cached.definition or None,
+            }
+
         api_key = _get_umls_api_key()
         if not api_key:
+            # If we at least have the cached label, return it without a definition
+            if cached:
+                return {
+                    'label': cached.preferred_name,
+                    'iri': cached.iri,
+                    'curie': f'UMLS:{cached.cui}',
+                    'ontology_name': 'umls',
+                    'definition': None,
+                }
             return {'error': 'UMLS API key not configured'}
-        try:
-            cui_resp = http_requests.get(
-                f'{UMLS_API_BASE}/content/current/CUI/{cui}',
-                params={'apiKey': api_key},
-                timeout=5,
-            )
-            cui_resp.raise_for_status()
-            concept = cui_resp.json().get('result', {})
 
-            definition = None
-            def_resp = http_requests.get(
-                f'{UMLS_API_BASE}/content/current/CUI/{cui}/definitions',
-                params={'apiKey': api_key, 'pageSize': 1},
-                timeout=5,
-            )
-            if def_resp.ok:
-                defs = def_resp.json().get('result', [])
-                if defs:
-                    definition = defs[0].get('value')
+        try:
+            # 2. Label: reuse cached preferred_name on partial hit, else fetch from UMLS
+            if cached:
+                label = cached.preferred_name
+            else:
+                cui_resp = http_requests.get(
+                    f'{UMLS_API_BASE}/content/current/CUI/{cui}',
+                    params={'apiKey': api_key},
+                    timeout=5,
+                )
+                cui_resp.raise_for_status()
+                concept = cui_resp.json().get('result', {})
+                label = concept.get('name') or cui
+
+            # 3. Definition: fetch once from UMLS
+            definition = ''
+            try:
+                def_resp = http_requests.get(
+                    f'{UMLS_API_BASE}/content/current/CUI/{cui}/definitions',
+                    params={'apiKey': api_key, 'pageSize': 1},
+                    timeout=5,
+                )
+                if def_resp.ok:
+                    defs = def_resp.json().get('result', [])
+                    if isinstance(defs, list) and defs:
+                        definition = defs[0].get('value') or ''
+                elif def_resp.status_code != 404:
+                    # Transient error (e.g., 500/429): keep None so we retry next time
+                    definition = None
+            except http_requests.RequestException as e:
+                log.debug(f'UMLS definitions fetch failed for {cui}: {e}')
+                definition = None
+
+            # 4. Write-back definition to PostgreSQL for cached tags
+            if cached and definition is not None:
+                UMLSCacheQuery.upsert(
+                    cui=cached.cui,
+                    ckan_tag_name=cached.ckan_tag_name,
+                    preferred_name=cached.preferred_name,
+                    iri=cached.iri,
+                    definition=definition,
+                )
 
             return {
-                'label': concept.get('name', cui),
+                'label': label,
                 'iri': iri,
                 'curie': f'UMLS:{cui}',
                 'ontology_name': 'umls',
-                'definition': definition,
+                'definition': definition or None,
             }
         except http_requests.RequestException as e:
             log.warning(f'UMLS term_details failed for {cui}: {e}')
+            if cached:
+                return {
+                    'label': cached.preferred_name,
+                    'iri': cached.iri,
+                    'curie': f'UMLS:{cached.cui}',
+                    'ontology_name': 'umls',
+                    'definition': None,
+                }
             return {'error': 'UMLS service unavailable'}
 
+    # Non-UMLS IRIs continue to use TIB Terminology Service
     try:
         term_resp = http_requests.get(
             f'{TIB_TS_API}/entities',
             params={'iri': iri, 'size': 1},
-            timeout=5
+            timeout=5,
         )
         term_resp.raise_for_status()
         term_data = term_resp.json()
@@ -271,26 +416,34 @@ def package_show(context, data_dict):
     for tag in tags:
         tag_id = tag.get('id')
         tag_row = TagQuery.read(tag_id)
-        if not tag_row:
-            log.debug(f"Tag {tag.get('name')} not found in Tag Table")
+        if tag_row:
+            tag['iri'] = tag_row.iri
+            tag['ontology'] = tag_row.ontology
+            if hasattr(tag_row, 'label') and tag_row.label:
+                tag['display_name'] = tag_row.label
+            if getattr(tag_row, 'vocabulary_id', None) and not tag.get('vocabulary_id'):
+                tag['vocabulary_id'] = tag_row.vocabulary_id
+            if tag_row.iri and tag_row.iri.startswith(UMLS_IRI_PREFIX):
+                tag['umls_cui'] = tag_row.iri[len(UMLS_IRI_PREFIX):].strip('/')
             continue
-        tag['iri'] = tag_row.iri
-        tag['ontology'] = tag_row.ontology
-        if tag_row.iri and tag_row.iri.startswith(UMLS_IRI_PREFIX):
-            tag['umls_cui'] = tag_row.iri[len(UMLS_IRI_PREFIX):].strip('/')
-        if hasattr(tag_row, 'label') and tag_row.label:
-            tag['display_name'] = tag_row.label
-        if getattr(tag_row, 'vocabulary_id', None) and not tag.get('vocabulary_id'):
-            tag['vocabulary_id'] = tag_row.vocabulary_id
+
+        umls_row = UMLSCacheQuery.get_by_tag_name(tag.get('name'))
+        if umls_row:
+            tag['iri'] = umls_row.iri
+            tag['ontology'] = 'umls'
+            tag['umls_cui'] = umls_row.cui
+            tag['display_name'] = umls_row.preferred_name
 
     return data
 
 def package_create(context, data_dict):
+    _persist_selected_umls_tags(data_dict)
     resolve_vocab_tags(data_dict)
     return core_package_create(context, data_dict)
 
 
 def package_update(context, data_dict):
+    _persist_selected_umls_tags(data_dict)
     resolve_vocab_tags(data_dict)
     return core_package_update(context, data_dict)
 
@@ -332,13 +485,16 @@ class LDMtagsPlugin(plugins.SingletonPlugin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         tag_model.init_table()
+        umls_cache_model.init_table()
         self.scheduler = None
 
     def before_create(self, context, data_dict):
+        _persist_selected_umls_tags(data_dict)
         resolve_vocab_tags(data_dict)
         return data_dict
 
     def before_update(self, context, data_dict):
+        _persist_selected_umls_tags(data_dict)
         resolve_vocab_tags(data_dict)
         return data_dict
 
