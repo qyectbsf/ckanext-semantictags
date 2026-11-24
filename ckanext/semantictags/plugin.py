@@ -416,14 +416,14 @@ def package_show(context, data_dict):
     for tag in tags:
         tag_id = tag.get('id')
         tag_row = TagQuery.read(tag_id)
-        if tag_row:
+        if tag_row and tag_row.iri:
             tag['iri'] = tag_row.iri
             tag['ontology'] = tag_row.ontology
             if hasattr(tag_row, 'label') and tag_row.label:
                 tag['display_name'] = tag_row.label
             if getattr(tag_row, 'vocabulary_id', None) and not tag.get('vocabulary_id'):
                 tag['vocabulary_id'] = tag_row.vocabulary_id
-            if tag_row.iri and tag_row.iri.startswith(UMLS_IRI_PREFIX):
+            if tag_row.iri.startswith(UMLS_IRI_PREFIX):
                 tag['umls_cui'] = tag_row.iri[len(UMLS_IRI_PREFIX):].strip('/')
             continue
 
@@ -432,6 +432,7 @@ def package_show(context, data_dict):
             tag['iri'] = umls_row.iri
             tag['ontology'] = 'umls'
             tag['umls_cui'] = umls_row.cui
+            tag['label'] = umls_row.preferred_name
             tag['display_name'] = umls_row.preferred_name
 
     return data
